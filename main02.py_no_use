@@ -1,74 +1,42 @@
 import csv
 import os
-import shutil
-import logging
-import re
 import io
-import json
-from typing import List
+import re
 
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-
-app = FastAPI()
-app.mount("/ui", StaticFiles(directory="."), name="ui")
-
-# Setup
-logging.basicConfig(level=logging.INFO)
-DEST_DIR = "validated_files"
-os.makedirs(DEST_DIR, exist_ok=True)
-
-# Load validation rules from JSON
-with open("validation_rules.json") as f:
-    RULES_BY_FILENAME = json.load(f)
-
-# Match a timestamped filename to rule base
-def match_rule_filename(uploaded_filename: str, available_rule_files: List[str]) -> str:
-    for rule_file in available_rule_files:
-        base = rule_file.replace('.csv', '')
-        pattern = re.compile(rf"^{re.escape(base)}(_\d{{8}}(_\d{{6}})?)?\.csv$", re.IGNORECASE)
-        if pattern.match(uploaded_filename):
-            return rule_file
-    return None
-
-# Detect delimiter from header
-def get_delimiter_from_header(header_line):
-    for delim in [',', '|', '\t', ';']:
-        if delim in header_line:
-            return delim
-    return ','
-
-# Main validation logic
 def check_csv_file(file_path):
+    # 1. Read entire content
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    lines = content.splitlines()
-    if not lines:
+    if not content.strip():
         return {"status": "Failed", "reason": "File is empty."}
 
-    delimiter = get_delimiter_from_header(lines[0])
+    # 2. Extract and detect delimiter from the first line
+    first_line = content.splitlines()[0]
+    delimiter = get_delimiter_from_header(first_line)
+
+    # 3. Parse the CSV with the detected delimiter
     reader = csv.reader(io.StringIO(content), delimiter=delimiter)
     rows = list(reader)
 
-    if not rows:
-        return {"status": "Failed", "reason": "No rows found."}
+    if not rows or not rows[0]:
+        return {"status": "Failed", "reason": "CSV header missing or unreadable."}
 
+    # 4. Extract header and basic metadata
     header = rows[0]
     expected_fields = len(header)
     filename = os.path.basename(file_path)
 
+    # 5. Match rules based on filename (strip timestamp etc.)
     rule_key = match_rule_filename(filename, list(RULES_BY_FILENAME.keys()))
     rules = RULES_BY_FILENAME.get(rule_key, {})
     col_index_map = {col: idx for idx, col in enumerate(header)}
 
-    mismatches = []
-    nulls = []
-    type_errors = []
-    regex_errors = []
+    # 6. Initialize validation results
+    mismatches, nulls, type_errors, regex_errors = [], [], [], []
 
-    for i, row in enumerate(rows[1:], start=2):  # start=2 for human-readable
+    # 7. Validate each row against rules
+    for i, row in enumerate(rows[1:], start=2):  # start=2 for user-facing row numbers
         actual_fields = len(row)
 
         if actual_fields != expected_fields:
@@ -78,15 +46,16 @@ def check_csv_file(file_path):
                 "content": delimiter.join(row),
                 "issue": f"{issue_type} fields ({actual_fields}) than expected ({expected_fields})"
             })
-            continue
+            continue  # Skip further checks if column count is wrong
 
         for col, rule in rules.items():
             idx = col_index_map.get(col)
             if idx is None or idx >= len(row):
-                continue
+                continue  # Column not found or index out of range
 
             value = row[idx].strip()
-            # Required
+
+            # Rule 1: Required / Null check
             if rule.get("required") and not value:
                 nulls.append({
                     "row": i,
@@ -94,7 +63,7 @@ def check_csv_file(file_path):
                     "issue": f"Missing required value in column '{col}'"
                 })
 
-            # Type: numeric
+            # Rule 2: Type check
             if rule.get("type") == "numeric" and value and not value.replace('.', '', 1).isdigit():
                 type_errors.append({
                     "row": i,
@@ -102,15 +71,7 @@ def check_csv_file(file_path):
                     "issue": f"Expected numeric in column '{col}', got '{value}'"
                 })
 
-            # Type: string (basic check)
-            if rule.get("type") == "string" and value and not isinstance(value, str):
-                type_errors.append({
-                    "row": i,
-                    "content": delimiter.join(row),
-                    "issue": f"Expected string in column '{col}', got '{value}'"
-                })
-
-            # Regex check (default applied if none defined)
+            # Rule 3: Regex check (custom or default)
             pattern = rule.get("regex", r"^[a-zA-Z0-9\s.,_-]*$")
             if value and not re.match(pattern, value):
                 regex_errors.append({
@@ -119,52 +80,12 @@ def check_csv_file(file_path):
                     "issue": f"Special characters not allowed in column '{col}': '{value}'"
                 })
 
-    all_issues = mismatches + nulls + type_errors + regex_errors
-
+    # 8. Return validation result
+    issues = mismatches + nulls + type_errors + regex_errors
     return {
         "delimiter": delimiter,
         "expected_delimiters": expected_fields - 1,
         "total_data_rows": len(rows) - 1,
-        "row_issues": all_issues,
-        "status": "Failed" if all_issues else "Successful"
+        "row_issues": issues,
+        "status": "Failed" if issues else "Successful"
     }
-
-@app.post("/validate_csv/")
-async def validate(files: List[UploadFile] = File(...)):
-    results = []
-    for file in files:
-        temp_path = f"temp_{file.filename}"
-        with open(temp_path, "wb") as f_out:
-            shutil.copyfileobj(file.file, f_out)
-
-        result = check_csv_file(temp_path)
-        result["filename"] = file.filename
-        results.append(result)
-
-        if result["status"] == "Successful":
-            shutil.copy(temp_path, os.path.join(DEST_DIR, file.filename))
-
-        os.remove(temp_path)
-
-    return {"results": results}
-
-@app.get("/", response_class=HTMLResponse)
-def serve_ui():
-    with open("csv_validator_ui.html", "r", encoding="utf-8") as f:
-        return f.read()
-
-
-
-
-{
-  "sample_file.csv": {
-    "id": { "required": true, "type": "numeric" },
-    "name": { "required": true, "type": "string" },
-    "email": { "required": true, "type": "string", "regex": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$" }
-  },
-  "employee_data.csv": {
-    "emp_id": { "required": true, "type": "numeric" },
-    "full_name": { "required": true, "type": "string" },
-    "comments": { "required": false, "type": "string", "regex": ".*" }  // allow all
-  }
-}
