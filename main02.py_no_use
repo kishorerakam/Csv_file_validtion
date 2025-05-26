@@ -1,91 +1,36 @@
-import csv
-import os
-import io
-import re
+# Rule 1: Required / Null check
+if rule.get("required") and not value:
+    nulls.append({
+        "row": i,
+        "content": delimiter.join(row),
+        "issue": f"Missing required value in column '{col}'"
+    })
 
-def check_csv_file(file_path):
-    # 1. Read entire content
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    if not content.strip():
-        return {"status": "Failed", "reason": "File is empty."}
-
-    # 2. Extract and detect delimiter from the first line
-    first_line = content.splitlines()[0]
-    delimiter = get_delimiter_from_header(first_line)
-
-    # 3. Parse the CSV with the detected delimiter
-    reader = csv.reader(io.StringIO(content), delimiter=delimiter)
-    rows = list(reader)
-
-    if not rows or not rows[0]:
-        return {"status": "Failed", "reason": "CSV header missing or unreadable."}
-
-    # 4. Extract header and basic metadata
-    header = rows[0]
-    expected_fields = len(header)
-    filename = os.path.basename(file_path)
-
-    # 5. Match rules based on filename (strip timestamp etc.)
-    rule_key = match_rule_filename(filename, list(RULES_BY_FILENAME.keys()))
-    rules = RULES_BY_FILENAME.get(rule_key, {})
-    col_index_map = {col: idx for idx, col in enumerate(header)}
-
-    # 6. Initialize validation results
-    mismatches, nulls, type_errors, regex_errors = [], [], [], []
-
-    # 7. Validate each row against rules
-    for i, row in enumerate(rows[1:], start=2):  # start=2 for user-facing row numbers
-        actual_fields = len(row)
-
-        if actual_fields != expected_fields:
-            issue_type = "fewer" if actual_fields < expected_fields else "extra"
-            mismatches.append({
+# Rule 2: Type check (numeric)
+if rule.get("type") == "numeric":
+    try:
+        float(value)
+    except ValueError:
+        type_errors.append({
+            "row": i,
+            "content": delimiter.join(row),
+            "issue": f"Expected numeric in column '{col}', got '{value}'"
+        })
+    else:
+        # ✅ Only do regex check if numeric passes
+        pattern = rule.get("regex", r"^[\d.eE+-]+$")
+        if value and not re.match(pattern, value):
+            regex_errors.append({
                 "row": i,
                 "content": delimiter.join(row),
-                "issue": f"{issue_type} fields ({actual_fields}) than expected ({expected_fields})"
+                "issue": f"Special characters not allowed in column '{col}': '{value}'"
             })
-            continue  # Skip further checks if column count is wrong
 
-        for col, rule in rules.items():
-            idx = col_index_map.get(col)
-            if idx is None or idx >= len(row):
-                continue  # Column not found or index out of range
-
-            value = row[idx].strip()
-
-            # Rule 1: Required / Null check
-            if rule.get("required") and not value:
-                nulls.append({
-                    "row": i,
-                    "content": delimiter.join(row),
-                    "issue": f"Missing required value in column '{col}'"
-                })
-
-            # Rule 2: Type check
-            if rule.get("type") == "numeric" and value and not value.replace('.', '', 1).isdigit():
-                type_errors.append({
-                    "row": i,
-                    "content": delimiter.join(row),
-                    "issue": f"Expected numeric in column '{col}', got '{value}'"
-                })
-
-            # Rule 3: Regex check (custom or default)
-            pattern = rule.get("regex", r"^[a-zA-Z0-9\s.,_-]*$")
-            if value and not re.match(pattern, value):
-                regex_errors.append({
-                    "row": i,
-                    "content": delimiter.join(row),
-                    "issue": f"Special characters not allowed in column '{col}': '{value}'"
-                })
-
-    # 8. Return validation result
-    issues = mismatches + nulls + type_errors + regex_errors
-    return {
-        "delimiter": delimiter,
-        "expected_delimiters": expected_fields - 1,
-        "total_data_rows": len(rows) - 1,
-        "row_issues": issues,
-        "status": "Failed" if issues else "Successful"
-    }
+elif rule.get("type") == "string":
+    pattern = rule.get("regex", r"^[a-zA-Z0-9\s.,_-]*$")
+    if value and not re.match(pattern, value):
+        regex_errors.append({
+            "row": i,
+            "content": delimiter.join(row),
+            "issue": f"Special characters not allowed in column '{col}': '{value}'"
+        })
