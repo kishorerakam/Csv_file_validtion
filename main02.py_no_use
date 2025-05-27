@@ -1,36 +1,180 @@
-# Rule 1: Required / Null check
-if rule.get("required") and not value:
-    nulls.append({
-        "row": i,
-        "content": delimiter.join(row),
-        "issue": f"Missing required value in column '{col}'"
-    })
+import csv
+import os
+import io
+import re
+import json
+import shutil
+import logging
+import paramiko
+from typing import List
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
-# Rule 2: Type check (numeric)
-if rule.get("type") == "numeric":
-    try:
-        float(value)
-    except ValueError:
-        type_errors.append({
-            "row": i,
-            "content": delimiter.join(row),
-            "issue": f"Expected numeric in column '{col}', got '{value}'"
-        })
-    else:
-        # ✅ Only do regex check if numeric passes
-        pattern = rule.get("regex", r"^[\d.eE+-]+$")
-        if value and not re.match(pattern, value):
-            regex_errors.append({
+app = FastAPI()
+
+app.mount("/ui", StaticFiles(directory="."), name="ui")
+
+logging.basicConfig(level=logging.INFO)
+DEST_DIR = "validated_files"
+os.makedirs(DEST_DIR, exist_ok=True)
+
+#SFTP_HOST = "your.sftp.host"
+#SFTP_PORT = 22
+#SFTP_USER = "your_user"
+#SFTP_PASS = "your_password"
+#SFTP_REMOTE_DIR = "/path/on/server"
+
+with open("validation_rules.json") as f:
+    RULES_BY_FILENAME = json.load(f)
+
+def match_rule_filename(uploaded_filename, available_rule_files):
+    for rule_file in available_rule_files:
+        base = rule_file.replace(".csv", "")
+        if uploaded_filename.lower().startswith(f"temp_{base}".lower()):
+            return rule_file
+    return None
+
+def get_delimiter_from_header(header_line):
+    for delim in [',', '|', '\t', ';']:
+        if delim in header_line:
+            return delim
+    return ','
+
+def copy_to_outbound(local_path, filename):
+    OUTBOUND_DIR = "outbound_files"
+    os.makedirs(OUTBOUND_DIR, exist_ok=True)
+    dest_path = os.path.join(OUTBOUND_DIR, filename)
+    shutil.copy(local_path, dest_path)
+    logging.info(f"📁 Copied to outbound: {dest_path}")
+
+def check_csv_file(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    if not content.strip():
+        return {"status": "Failed", "reason": "File is empty.", "row_issues": []}
+
+    delimiter = get_delimiter_from_header(content.splitlines()[0])
+    reader = csv.reader(io.StringIO(content), delimiter=delimiter)
+    rows = list(reader)
+
+    if not rows or not rows[0]:
+        return {"status": "Failed", "reason": "CSV header missing or unreadable.", "row_issues": []}
+
+    header = rows[0]
+    expected_fields = len(header)
+    filename = os.path.basename(file_path)
+
+    rule_key = match_rule_filename(filename, list(RULES_BY_FILENAME.keys()))
+    if not rule_key:
+        return {
+            "status": "Failed",
+            "row_issues": [],
+            "reason": f"No validation rule found for file: {filename}"
+        }
+
+    rules = RULES_BY_FILENAME[rule_key]
+    col_index_map = {col: idx for idx, col in enumerate(header)}
+
+    mismatches, nulls, type_errors, regex_errors = [], [], [], []
+
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) != expected_fields:
+            issue_type = "fewer" if len(row) < expected_fields else "extra"
+            mismatches.append({
                 "row": i,
                 "content": delimiter.join(row),
-                "issue": f"Special characters not allowed in column '{col}': '{value}'"
+                "issue": f"{issue_type} fields ({len(row)}) than expected ({expected_fields})"
             })
+            continue
 
-elif rule.get("type") == "string":
-    pattern = rule.get("regex", r"^[a-zA-Z0-9\s.,_-]*$")
-    if value and not re.match(pattern, value):
-        regex_errors.append({
-            "row": i,
-            "content": delimiter.join(row),
-            "issue": f"Special characters not allowed in column '{col}': '{value}'"
-        })
+        for col, rule in rules.items():
+            idx = col_index_map.get(col)
+            if idx is None or idx >= len(row):
+                continue # Column not found or index out of range
+
+            value = row[idx].strip()
+
+            if rule.get("required") and not value:
+                nulls.append({
+                    "row": i,
+                    "content": delimiter.join(row),
+                    "issue": f"Missing required value in column '{col}'"
+                })
+                continue
+
+            if rule.get("type") == "numeric":
+                try:
+                    float(value)
+                except ValueError:
+                    type_errors.append({
+                        "row": i,
+                        "content": delimiter.join(row),
+                        "issue": f"Expected numeric in column '{col}', got '{value}'"
+                    })
+                    continue
+
+                pattern = rule.get("regex", r"^[\d.eE+-]+$")
+                if value and not re.match(pattern, value):
+                    regex_errors.append({
+                        "row": i,
+                        "content": delimiter.join(row),
+                        "issue": f"Special characters not allowed in column '{col}': '{value}'"
+                    })
+
+            elif rule.get("type") == "string":
+                pattern = rule.get("regex", r"^[a-zA-Z0-9\s.,_-]*$")
+                if value and not re.match(pattern, value):
+                    regex_errors.append({
+                        "row": i,
+                        "content": delimiter.join(row),
+                        "issue": f"Special characters not allowed in column '{col}': '{value}'"
+                    })
+
+    all_issues = mismatches + nulls + type_errors + regex_errors
+    print(f"[DEBUG] Rule matched for file: {rule_key}")
+    print(f"[DEBUG] Total issues collected: {len(all_issues)}")
+    status = "Failed" if all_issues else "Successful"
+    print(f"[DEBUG] Final status: {status} for file: {filename}")
+    return {
+        "delimiter": delimiter,
+        "expected_delimiters": expected_fields - 1,
+        "total_data_rows": len(rows) - 1,
+        "row_issues": all_issues,
+        "status": status,
+        "reason": None if all_issues else "All checks passed."
+    }
+
+@app.post("/validate_csv/")
+async def validate(files: List[UploadFile] = File(...)):
+    results_all = []
+    for file in files:
+        temp_path = f"temp_{file.filename}"
+        with open(temp_path, "wb") as f_out:
+            shutil.copyfileobj(file.file, f_out)
+
+        result = check_csv_file(temp_path)
+        result["filename"] = file.filename
+        print(f"result : {result}")
+        results_all.append(result)
+
+        if result["status"] == "Successful":
+            try:
+                shutil.copy(temp_path, os.path.join(DEST_DIR, file.filename))
+                print(f"✅ Copied to: {DEST_DIR}/{file.filename}")
+                copy_to_outbound(temp_path, file.filename)
+            except Exception as e:
+                logging.error(f"Post-validation action failed: {e}")
+
+        try:
+            os.remove(temp_path)
+        except Exception as e:
+            logging.warning(f"Failed to delete temp file {file.filename}: {e}")
+
+    return {"results": results_all}
+
+@app.get("/", response_class=HTMLResponse)
+def serve_ui():
+    with open("csv_validator_ui.html", "r", encoding="utf-8") as f:
+        return f.read()
